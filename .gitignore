@@ -1,0 +1,51 @@
+# build output - shipped as release assets, never committed
+dist/
+build/
+*.egg-info/
+*.spec.bak
+
+# executables and archives
+*.exe
+*.dll
+*.pdb
+*.zip
+*.whl
+*.tar.gz
+
+# virtual environments
+.venv/
+venv/
+env/
+
+# python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# local settings and logs
+config.json
+*.log
+*.tmp
+*_backup_*/
+backup/
+*.sav
+SaveData*.sav
+demo/
+
+# private screenshots and notes
+screenshots/private/
+notes/
+
+# IDE and OS noise
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
+*.lnk
+~$*
+.DS_Store

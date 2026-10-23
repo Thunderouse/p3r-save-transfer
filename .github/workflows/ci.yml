@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: repo guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Secrets / PII / binaries in the index
+        run: python tools/repo_guard.py
+      - name: Version is readable
+        run: python tools/version.py
+
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The hostedtoolcache Windows builds ship without complete Tcl/Tk, so the
+      # GUI tests and PyInstaller need the official python.org installation.
+      - name: Install python.org Python with Tcl/Tk (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $full = @{ "3.10" = "3.10.11"; "3.12" = "3.12.10" }["${{ matrix.python }}"]
+          $installer = Join-Path $env:RUNNER_TEMP "python-$full.exe"
+          $target = Join-Path $env:RUNNER_TEMP "python-${{ matrix.python }}"
+          Invoke-WebRequest "https://www.python.org/ftp/python/$full/python-$full-amd64.exe" -OutFile $installer
+          Start-Process $installer -Wait -ArgumentList @(
+            "/quiet", "InstallAllUsers=0", "Include_tcltk=1", "Include_test=0",
+            "Include_launcher=0", "PrependPath=0", "TargetDir=$target"
+          )
+          "$target" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "$target\Scripts" | Out-File -FilePath $env:GITHUB_PATH -Append
+          & "$target\python.exe" -c "import tkinter; tkinter.Tk().destroy(); print('tkinter ok')"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Tk cannot start on this runner; GUI tests will skip themselves"
+          }
+
+      - uses: actions/setup-python@v5
+        if: runner.os != 'Windows'
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Tests
+        run: python -m pytest --cov --cov-branch
+
+      - name: Windows end-to-end (paths, cp866, long paths, round-trip)
+        if: runner.os == 'Windows'
+        run: python tools\windows_smoke.py

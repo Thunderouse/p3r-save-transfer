@@ -1,0 +1,94 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  portable:
+    name: build portable zip and publish
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # python.org installation: the hostedtoolcache build lacks complete Tcl/Tk,
+      # and the GUI executable has to bundle a working one.
+      - name: Install python.org Python 3.12 with Tcl/Tk
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "python-3.12.10.exe"
+          $target = Join-Path $env:RUNNER_TEMP "python-3.12"
+          Invoke-WebRequest "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe" -OutFile $installer
+          Start-Process $installer -Wait -ArgumentList @(
+            "/quiet", "InstallAllUsers=0", "Include_tcltk=1", "Include_test=0",
+            "Include_launcher=0", "PrependPath=0", "TargetDir=$target"
+          )
+          "$target" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "$target\Scripts" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Install
+        run: |
+          python -m pip install --disable-pip-version-check -e ".[dev]"
+
+      - name: Tests
+        run: python -m pytest
+
+      - name: Build portable folder, zip and checksum
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File tools\build_portable.ps1 -SkipTests
+          if ($LASTEXITCODE -ne 0) { throw "build_portable.ps1 exit $LASTEXITCODE" }
+          $version = (python tools/version.py).Trim()
+          $zip = Join-Path $PWD "dist/P3R-Save-Transfer-$version-win64-portable.zip"
+          if (-not (Test-Path $zip)) { throw "zip not found: ${zip}" }
+          python tools/check_archive.py $zip
+          if ($LASTEXITCODE -ne 0) { throw "check_archive.py rejected the archive" }
+          $zipName = Split-Path $zip -Leaf
+          $shaFile = $zip + ".sha256"
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText($shaFile, "$hash  $zipName`n")
+          $shaHash = (Get-FileHash $shaFile -Algorithm SHA256).Hash.ToLower()
+          "VERSION=$version" >> $env:GITHUB_ENV
+          "ZIP_PATH=$zip" >> $env:GITHUB_ENV
+          "SHA_PATH=$shaFile" >> $env:GITHUB_ENV
+          "ZIP_SHA=$hash" >> $env:GITHUB_ENV
+          "SHA_SHA=$shaHash" >> $env:GITHUB_ENV
+
+      - name: Extract the archive and run the console exe
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP "portable"
+          Remove-Item -Recurse -Force $target -ErrorAction SilentlyContinue
+          Expand-Archive -Path $env:ZIP_PATH -DestinationPath $target -Force
+          "extracted: $((Get-ChildItem $target | Select-Object -ExpandProperty Name) -join ', ')"
+          $exe = Join-Path $target "p3r-save-transfer-cli.exe"
+          $reported = (& $exe --version).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "console exe exit $LASTEXITCODE" }
+          if (-not $reported.Contains($env:VERSION)) { throw "console exe reported '$reported'" }
+          "console exe reports: $reported"
+
+      - name: Compose release notes
+        shell: pwsh
+        run: |
+          python tools/make_release_notes.py `
+            --version $env:VERSION `
+            --zip-sha $env:ZIP_SHA `
+            --sha-sha $env:SHA_SHA `
+            --out notes.md
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" `
+            "$env:ZIP_PATH" `
+            "$env:SHA_PATH" `
+            --verify-tag `
+            --prerelease `
+            --title "P3R Save Transfer Tool $env:VERSION" `
+            --notes-file notes.md
+          gh release view "$env:GITHUB_REF_NAME" --json tagName,name,isPrerelease,assets,url
