@@ -100,5 +100,11 @@
   "unit.kb": "КБ",
   "unit.mb": "МБ",
   "format.date": "%d.%m.%Y  %H:%M",
-  "footer.hotkeys": "Ctrl+O — папка · F5 — обновить · Ctrl+Enter — конвертировать · Esc — отмена"
+  "footer.hotkeys": "Ctrl+O — папка · F5 — обновить · Ctrl+Enter — конвертировать · Esc — отмена",
+  "table.skipped_title": "Пропущено ({count})",
+  "table.skipped_row": "{name} — {reason}",
+  "table.skipped_more": "…и ещё {count}",
+  "table.empty_skipped": "Пропущено {count} файл(ов):\n{reasons}\n\nЭто нормально: в папке могут лежать заметки, desktop.ini и недокачанные файлы. Подробности — в логе.",
+  "action.show_log": "Показать лог",
+  "help.about": "P3R Save Transfer Tool {version} · MIT · работает офлайн, данные не собирает · github.com/Thunderouse/p3r-save-transfer"
 }

@@ -100,5 +100,11 @@
   "unit.kb": "KB",
   "unit.mb": "MB",
   "format.date": "%Y-%m-%d  %H:%M",
-  "footer.hotkeys": "Ctrl+O — folder · F5 — rescan · Ctrl+Enter — convert · Esc — cancel"
+  "footer.hotkeys": "Ctrl+O — folder · F5 — rescan · Ctrl+Enter — convert · Esc — cancel",
+  "table.skipped_title": "Skipped ({count})",
+  "table.skipped_row": "{name} - {reason}",
+  "table.skipped_more": "...and {count} more",
+  "table.empty_skipped": "Skipped {count} file(s):\n{reasons}\n\nThat is normal: notes, desktop.ini and unfinished downloads can sit in the folder. See the log for details.",
+  "action.show_log": "Show log",
+  "help.about": "P3R Save Transfer Tool {version} · MIT · runs offline, collects nothing · github.com/Thunderouse/p3r-save-transfer"
 }

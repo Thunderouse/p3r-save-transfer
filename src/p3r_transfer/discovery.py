@@ -12,6 +12,11 @@ Steam layout::
 
 Everything is read through :mod:`p3r_transfer.fsutil`, so 260+ character
 paths work.  Discovery only ever reads.
+
+A save folder is a user folder: it may contain notes, ``desktop.ini``,
+``Thumbs.db``, half-downloaded files, backups or a truncated save.  Those are
+classified and reported, never treated as saves and never allowed to abort the
+scan (see :func:`scan_tree`).
 """
 
 from __future__ import annotations
@@ -20,8 +25,9 @@ import contextlib
 import logging
 import os
 import re
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections import Counter
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import codec, fsutil
@@ -35,6 +41,12 @@ PACKAGE_DIR = "SEGAofAmericaInc.L0cb6b3aea_s751p9cej88mt"
 WGS_RELATIVE = Path("Packages") / PACKAGE_DIR / "SystemAppData" / "wgs"
 STEAM_RELATIVE = Path("Sega") / "P3R" / "Steam"
 
+#: Anything above this is not a Persona 3 Reload save (real ones are ~1-2 MB).
+#: It is refused *before* reading so a stray video or image cannot exhaust memory.
+MAX_SAVE_BYTES: int = 32 * 1024 * 1024
+
+MIN_SAVE_BYTES: int = codec.MIN_SAVE_SIZE
+
 _GUID_RE = re.compile(r"^[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}$")
 _SLOT_RE = re.compile(r"^SaveData(\d{1,4})\.sav$", re.IGNORECASE)
 _SERVICE_PREFIXES = ("container.",)
@@ -44,6 +56,37 @@ KIND_LABELS = {
     SaveKind.OBFUSCATED: "обфусцированный (Steam)",
     SaveKind.UNKNOWN: "неизвестный",
 }
+
+#: Category names used in reports and in ``--json``.
+CATEGORY_GVAS = "save-gvas"
+CATEGORY_STEAM = "save-steam"
+CATEGORY_METADATA = "metadata"
+CATEGORY_SKIPPED = "skipped"
+
+#: Stable skip codes.  They are part of the public contract (README, JSON).
+SKIP_NOT_A_SAVE = "not-a-save"
+SKIP_EMPTY = "empty"
+SKIP_OS_JUNK = "os-junk"
+SKIP_TEMP_FILE = "temp-file"
+SKIP_UNREADABLE = "unreadable"
+SKIP_TOO_LARGE = "too-large"
+SKIP_NO_ACCESS = "no-access"
+
+SKIP_REASONS = (
+    SKIP_NOT_A_SAVE,
+    SKIP_EMPTY,
+    SKIP_OS_JUNK,
+    SKIP_TEMP_FILE,
+    SKIP_UNREADABLE,
+    SKIP_TOO_LARGE,
+    SKIP_NO_ACCESS,
+)
+
+OS_JUNK_NAMES = frozenset(
+    {"desktop.ini", "thumbs.db", "ehthumbs.db", ".ds_store", "icon\r", ".localized"}
+)
+OS_JUNK_PREFIXES = ("~$",)
+TEMP_SUFFIXES = frozenset({".tmp", ".bak", ".part", ".partial", ".crdownload", ".download"})
 
 
 @dataclass(frozen=True)
@@ -64,6 +107,58 @@ class SaveRecord:
     @property
     def kind_label(self) -> str:
         return KIND_LABELS[self.kind]
+
+    @property
+    def category(self) -> str:
+        return CATEGORY_GVAS if self.kind is SaveKind.GVAS else CATEGORY_STEAM
+
+
+@dataclass(frozen=True)
+class SkippedFile:
+    """A file that was looked at and deliberately not treated as a save."""
+
+    path: Path
+    reason: str
+    detail: str | None = None
+    size: int = 0
+    magic: int | None = None
+
+    @property
+    def category(self) -> str:
+        return CATEGORY_SKIPPED
+
+
+@dataclass
+class ScanResult:
+    """Everything a directory scan found, including what it refused."""
+
+    root: Path | None = None
+    saves: list[SaveRecord] = field(default_factory=list)
+    skipped: list[SkippedFile] = field(default_factory=list)
+    metadata: list[Path] = field(default_factory=list)
+    unreadable_dirs: list[Path] = field(default_factory=list)
+
+    def extend(self, other: ScanResult) -> ScanResult:
+        self.saves.extend(other.saves)
+        self.skipped.extend(other.skipped)
+        self.metadata.extend(other.metadata)
+        self.unreadable_dirs.extend(other.unreadable_dirs)
+        return self
+
+    @property
+    def metadata_files(self) -> int:
+        return len(self.metadata)
+
+    @property
+    def total_seen(self) -> int:
+        return len(self.saves) + len(self.skipped) + len(self.metadata)
+
+    def reason_counts(self) -> dict[str, int]:
+        return dict(Counter(item.reason for item in self.skipped))
+
+    def reason_summary(self) -> str:
+        counts = self.reason_counts()
+        return ", ".join(f"{reason}: {count}" for reason, count in sorted(counts.items()))
 
 
 def env_dir(variable: str) -> Path | None:
@@ -151,19 +246,53 @@ def find_steam_ids(steam_root: Path) -> list[Path]:
     return sorted(entries, key=lambda p: p.name)
 
 
-def _make_record(path: Path, *, root: Path | None = None) -> SaveRecord:
-    try:
-        stat = path.stat()
-        data = fsutil.read_bytes(path)
-    except TransferError as exc:
-        log.warning("Файл пропущен: %s", exc)
-        size = 0
-        with contextlib.suppress(OSError):
-            size = path.stat().st_size
-        return SaveRecord(
-            path=path, size=size, kind=SaveKind.UNKNOWN, mtime=0.0, note=str(exc)
-        )
+# ---------------------------------------------------------------- classifying
 
+
+def _reason_detail(reason: str, **parts: object) -> str:
+    """Human-readable Russian one-liner for a skip code."""
+    if reason == SKIP_OS_JUNK:
+        return "служебный файл Windows/Finder"
+    if reason == SKIP_TEMP_FILE:
+        return "временный файл или недокачанный фрагмент"
+    if reason == SKIP_EMPTY:
+        return "файл нулевого размера"
+    if reason == SKIP_TOO_LARGE:
+        return (
+            f"{parts.get('size_text', '?')} при пределе {parts.get('limit_text', '?')}: "
+            "это не сохранение P3R"
+        )
+    if reason == SKIP_UNREADABLE:
+        return str(parts.get("error") or "не удалось прочитать файл")
+    if reason == SKIP_NO_ACCESS:
+        return str(parts.get("error") or "каталог недоступен")
+    if reason == SKIP_NOT_A_SAVE:
+        return (
+            f"незнакомый magic {parts.get('magic', '?')}, "
+            f"начало файла {parts.get('head', '?')}"
+        )
+    return ""
+
+
+def _junk_reason(path: Path) -> str | None:
+    """Cheap name-only checks; nothing is opened here."""
+    name = path.name.lower()
+    if name.startswith(".") or name in OS_JUNK_NAMES or name.startswith(OS_JUNK_PREFIXES):
+        return SKIP_OS_JUNK
+    if path.suffix.lower() in TEMP_SUFFIXES:
+        return SKIP_TEMP_FILE
+    return None
+
+
+def is_service_name(name: str) -> bool:
+    """``container.0000`` and friends are Xbox bookkeeping, not saves."""
+    lowered = name.lower()
+    return lowered == "container" or lowered.startswith(_SERVICE_PREFIXES)
+
+
+def _record_from_bytes(
+    path: Path, data: bytes, *, stat_size: int, mtime: float, root: Path | None
+) -> SaveRecord:
     kind = codec.detect_kind(data)
     meta = None
     if kind is SaveKind.GVAS:
@@ -185,9 +314,9 @@ def _make_record(path: Path, *, root: Path | None = None) -> SaveRecord:
 
     return SaveRecord(
         path=path,
-        size=len(data),
+        size=stat_size,
         kind=kind,
-        mtime=stat.st_mtime,
+        mtime=mtime,
         container_guid=container_guid,
         user_id=user_id,
         slot=slot_from_filename(path.name),
@@ -196,29 +325,182 @@ def _make_record(path: Path, *, root: Path | None = None) -> SaveRecord:
     )
 
 
-def iter_wgs_saves(root: Path) -> Iterable[SaveRecord]:
-    """Yield every save found under the ``wgs`` tree (read-only)."""
+def inspect_file(
+    path: Path, *, root: Path | None = None
+) -> SaveRecord | SkippedFile | None:
+    """Classify one file.
+
+    Returns a :class:`SaveRecord` for a save, a :class:`SkippedFile` for
+    anything else, and ``None`` for Xbox bookkeeping (``container.*``), which is
+    counted separately instead of being reported as a problem.
+    """
+    if is_service_name(path.name):
+        return None  # container.* is Xbox bookkeeping, not a problem file
+
+    junk = _junk_reason(path)
+    if junk is not None:
+        return SkippedFile(path=path, reason=junk, detail=_reason_detail(junk))
+
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return SkippedFile(
+            path=path, reason=SKIP_UNREADABLE, detail="файл исчез во время сканирования"
+        )
+    except OSError as exc:
+        return SkippedFile(
+            path=path, reason=SKIP_UNREADABLE, detail=_reason_detail(SKIP_UNREADABLE, error=exc)
+        )
+
+    if stat.st_size == 0:
+        return SkippedFile(path=path, reason=SKIP_EMPTY, detail=_reason_detail(SKIP_EMPTY))
+
+    if stat.st_size > MAX_SAVE_BYTES:
+        return SkippedFile(
+            path=path,
+            reason=SKIP_TOO_LARGE,
+            size=stat.st_size,
+            detail=_reason_detail(
+                SKIP_TOO_LARGE,
+                size_text=fsutil.human_size(stat.st_size),
+                limit_text=fsutil.human_size(MAX_SAVE_BYTES),
+            ),
+        )
+
+    try:
+        head = fsutil.read_head(path, 16)
+    except TransferError as exc:
+        return SkippedFile(
+            path=path,
+            reason=SKIP_UNREADABLE,
+            size=stat.st_size,
+            detail=_reason_detail(SKIP_UNREADABLE, error=exc.message),
+        )
+
+    kind = codec.detect_kind(head)
+    if kind is SaveKind.UNKNOWN:
+        magic = codec.magic_of(head)
+        return SkippedFile(
+            path=path,
+            reason=SKIP_NOT_A_SAVE,
+            size=stat.st_size,
+            magic=magic,
+            detail=_reason_detail(
+                SKIP_NOT_A_SAVE,
+                magic=codec.format_magic(head),
+                head=head[:16].hex(" "),
+            ),
+        )
+
+    if stat.st_size < MIN_SAVE_BYTES:
+        return SkippedFile(
+            path=path,
+            reason=SKIP_NOT_A_SAVE,
+            size=stat.st_size,
+            magic=codec.magic_of(head),
+            detail=f"файл короче минимальных {MIN_SAVE_BYTES} байт",
+        )
+
+    try:
+        data = fsutil.read_bytes(path)
+    except TransferError as exc:
+        return SkippedFile(
+            path=path,
+            reason=SKIP_UNREADABLE,
+            size=stat.st_size,
+            detail=_reason_detail(SKIP_UNREADABLE, error=exc.message),
+        )
+    except MemoryError:  # a file that grew after the size check
+        return SkippedFile(
+            path=path,
+            reason=SKIP_TOO_LARGE,
+            size=stat.st_size,
+            detail="файл не помещается в память",
+        )
+
+    record = _record_from_bytes(
+        path, data, stat_size=stat.st_size, mtime=stat.st_mtime, root=root
+    )
+    return record
+
+
+def scan_tree(root: Path, *, include_skipped: bool = False) -> ScanResult:
+    """Walk a wgs tree and classify every file.
+
+    Never raises because of one file: unreadable files, junk and unknown
+    contents end up in :attr:`ScanResult.skipped`.  ``include_skipped`` turns
+    files with an unknown magic into attempts (``not-a-save`` entries get a
+    :class:`SaveRecord` with ``kind=UNKNOWN``) - the caller still must not
+    crash on them.
+    """
+    result = ScanResult(root=Path(root))
     for path in fsutil.iter_files(root):
-        if path.name.lower().startswith(_SERVICE_PREFIXES):
-            continue
-        if path.name.startswith("."):
-            continue
-        try:
-            if path.stat().st_size == 0:
-                continue
-        except OSError:
-            continue
-        if path.suffix.lower() in {".tmp", ".log"}:
-            continue
-        yield _make_record(path, root=root)
+        verdict = inspect_file(path, root=Path(root))
+        if verdict is None:
+            result.metadata.append(path)
+        elif isinstance(verdict, SaveRecord):
+            result.saves.append(verdict)
+        elif include_skipped and verdict.reason == SKIP_NOT_A_SAVE:
+            result.saves.append(
+                SaveRecord(
+                    path=verdict.path,
+                    size=verdict.size,
+                    kind=SaveKind.UNKNOWN,
+                    mtime=_safe_mtime(verdict.path),
+                    magic=verdict.magic,
+                    note=verdict.detail,
+                )
+            )
+        else:
+            result.skipped.append(verdict)
+    return result
 
 
-def iter_steam_saves(steam_root: Path) -> Iterable[SaveRecord]:
+def _safe_mtime(path: Path) -> float:
+    with contextlib.suppress(OSError):
+        return path.stat().st_mtime
+    return 0.0
+
+
+def scan_steam(steam_root: Path, *, include_skipped: bool = False) -> ScanResult:
+    """Classify the files of every Steam account folder."""
+    result = ScanResult(root=Path(steam_root))
     for steam_id in find_steam_ids(steam_root):
-        for path in sorted(steam_id.glob("SaveData*.sav")):
+        for path in sorted(steam_id.iterdir()):
             if not path.is_file():
                 continue
-            yield _make_record(path)
+            verdict = inspect_file(path)
+            if verdict is None:
+                result.metadata.append(path)
+            elif isinstance(verdict, SaveRecord):
+                result.saves.append(verdict)
+            elif include_skipped and verdict.reason == SKIP_NOT_A_SAVE:
+                result.saves.append(
+                    SaveRecord(
+                        path=verdict.path,
+                        size=verdict.size,
+                        kind=SaveKind.UNKNOWN,
+                        mtime=_safe_mtime(verdict.path),
+                        magic=verdict.magic,
+                        note=verdict.detail,
+                    )
+                )
+            else:
+                result.skipped.append(verdict)
+    return result
+
+
+def iter_wgs_saves(root: Path) -> Iterator[SaveRecord]:
+    """Yield the real saves under *root* (junk is filtered out, never raised).
+
+    Kept for callers that only need the saves; :func:`scan_tree` also returns
+    what was skipped.
+    """
+    yield from scan_tree(root).saves
+
+
+def iter_steam_saves(steam_root: Path) -> Iterator[SaveRecord]:
+    yield from scan_steam(steam_root).saves
 
 
 def sort_for_slots(records: Iterable[SaveRecord]) -> list[SaveRecord]:
@@ -229,6 +511,7 @@ def sort_for_slots(records: Iterable[SaveRecord]) -> list[SaveRecord]:
     first has the least play time.  Files without metadata fall back to mtime
     and are placed after the measured ones.
     """
+
     def key(record: SaveRecord):
         play_time = record.meta.play_time_seconds if record.meta else None
         if play_time is None:

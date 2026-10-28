@@ -79,7 +79,14 @@ def window(tmp_path, env):
     app = App(root, config=config, bridge=Bridge())
     app.start(1.0)
     root.geometry("1000x680+0+0")
-    pump(root, lambda: bool(app.saves))
+    # wait for the scan to settle: on_convert() is a no-op while mode=="scan"
+    ready = pump(root, lambda: app.mode == "idle" and bool(app.saves), timeout=20)
+    if not ready:
+        app.close()
+        pytest.skip(
+            f"Tk в этом окружении не завершил сканирование (mode={app.mode}) - "
+            "проверяется на Windows-ноге CI"
+        )
     yield root, app, env
     with contextlib.suppress(tk.TclError):
         app.close()

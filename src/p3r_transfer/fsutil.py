@@ -12,11 +12,13 @@ Three things this module exists for:
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import logging
 import ntpath
 import os
+import shutil
 import sys
 from collections.abc import Iterator
 from datetime import datetime
@@ -88,6 +90,96 @@ def read_bytes(path: str | Path) -> bytes:
         if exc.errno in _SHARING_ERRNOS or getattr(exc, "winerror", None) in _SHARING_WINERRORS:
             raise _locked(path) from exc
         raise TransferError(f"Не удалось прочитать файл: {path}", hint=str(exc)) from exc
+
+
+def read_head(path: str | Path, count: int = 16) -> bytes:
+    """Read at most *count* bytes; enough to classify a file by its magic."""
+    try:
+        with open(extended_path(path), "rb") as handle:
+            return handle.read(count)
+    except FileNotFoundError as exc:
+        raise SaveNotFoundError(
+            f"Файл не найден: {path}",
+            hint="Проверьте путь; для облачных сохранений Xbox файл должен быть уже на диске.",
+        ) from exc
+    except PermissionError as exc:
+        raise _locked(path) from exc
+    except OSError as exc:
+        if exc.errno in _SHARING_ERRNOS or getattr(exc, "winerror", None) in _SHARING_WINERRORS:
+            raise _locked(path) from exc
+        raise TransferError(f"Не удалось прочитать файл: {path}", hint=str(exc)) from exc
+
+
+def write_bytes_atomic(path: str | Path, data: bytes, *, min_size: int | None = None) -> None:
+    """Write ``data`` to *path* atomically and verify what landed on disk.
+
+    The bytes go to ``<name>.tmp`` in the same directory, are flushed and
+    fsynced, read back for a size/magic check and only then ``os.replace``d over
+    the target.  A crash or a full disk leaves the old file untouched instead of
+    a half-written save.
+    """
+    target = Path(path)
+    parent = target.parent
+    if parent and not parent.exists():
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise TransferError(
+                f"Не удалось создать каталог: {parent}",
+                hint=f"{exc}. Проверьте права на запись - повышение прав не требуется.",
+            ) from exc
+
+    temp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    try:
+        with open(extended_path(temp), "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        written = temp.stat().st_size
+        if written != len(data):
+            raise TransferError(
+                f"Записано {written} байт вместо {len(data)}: {temp}",
+                hint="Диск переполнен или файл усечён. Целевой файл не изменён.",
+            )
+        if min_size is not None and written < min_size:
+            raise TransferError(f"Результат короче {min_size} байт: {temp}")
+        if data[:4] and read_head(temp, 4) != data[:4]:
+            raise TransferError(
+                f"Проверка после записи не прошла (magic не совпал): {temp}",
+                hint="Целевой файл не изменён; попробуйте другой диск.",
+            )
+        os.replace(extended_path(temp), extended_path(target))
+    except TransferError:
+        _discard(temp)
+        raise
+    except PermissionError as exc:
+        _discard(temp)
+        raise _locked(target) from exc
+    except OSError as exc:
+        _discard(temp)
+        if exc.errno in _SHARING_ERRNOS or getattr(exc, "winerror", None) in _SHARING_WINERRORS:
+            raise _locked(target) from exc
+        raise TransferError(f"Не удалось записать файл: {target}", hint=str(exc)) from exc
+
+    if target.stat().st_size != len(data):  # pragma: no cover - filesystem lying
+        raise TransferError(f"Размер файла на диске не совпал с ожидаемым: {target}")
+
+
+def _discard(path: Path) -> None:
+    with contextlib.suppress(OSError):
+        path.unlink()
+
+
+def free_space(path: str | Path) -> int:
+    """Free bytes on the volume that would hold *path* (walks up to a parent)."""
+    probe = Path(path)
+    for candidate in [probe, *probe.parents]:
+        try:
+            if candidate.exists():
+                return shutil.disk_usage(candidate).free
+        except OSError:
+            continue
+    return 0
 
 
 def write_bytes(path: str | Path, data: bytes) -> None:

@@ -97,6 +97,7 @@ def main() -> int:
         }
         (leaf / f"C0FFEE0000000000000000000000000{index}").write_bytes(synth.save(words))
         (leaf / "container.0000").write_bytes(b"\x00" * 64)
+        (leaf / "notes.txt").write_bytes(b"my notes, not a save\n")
 
     env = dict(os.environ)
     env["LOCALAPPDATA"] = str(local)
@@ -113,8 +114,15 @@ def main() -> int:
     # 1. scan --json finds all three saves and reads their metadata
     result = run_tool("scan", "--json", env=env)
     check("scan: exit code 0", result.returncode == 0, result.stderr)
-    records = json.loads(result.stdout or "[]")
+    payload = json.loads(result.stdout or "{}")
+    records = payload["saves"]
     check("scan: 3 saves found", len(records) == 3, f"got {len(records)}")
+    check(
+        "scan: json has skipped/counts",
+        payload["counts"]["skipped"] == 3
+        and all(item["reason"] == "not-a-save" for item in payload["skipped"]),
+        json.dumps(payload.get("counts"), ensure_ascii=False),
+    )
     check(
         "scan: metadata parsed",
         any(record["meta"] and record["meta"]["level"] for record in records),
@@ -131,14 +139,20 @@ def main() -> int:
         check(f"{codepage}: exit code 0", con.returncode == 0, con.stderr[-400:])
         check(
             f"{codepage}: Russian text intact",
-            "Найдено сохранений: 3" in con.stdout,
+            "Сохранений: 3" in con.stdout,
             con.stdout[:300],
         )
 
     # 3. convert-all
     out = tmp / "out"
     result = run_tool("convert-all", "--wgs", str(wgs), "--out-dir", str(out), env=env)
-    check("convert-all: exit code 0", result.returncode == 0, result.stderr)
+    # notes.txt in each folder is skipped -> partial success (exit 3)
+    check("convert-all: exit code 3 (partial)", result.returncode == 3, result.stderr[-300:])
+    check(
+        "convert-all: skip reason reported",
+        "not-a-save" in result.stdout and "Сконвертировано 3, пропущено 3" in result.stdout,
+        result.stdout[-400:],
+    )
     produced = sorted(out.glob("SaveData*.sav"))
     check("convert-all: 3 files", len(produced) == 3, str([p.name for p in produced]))
     if produced:

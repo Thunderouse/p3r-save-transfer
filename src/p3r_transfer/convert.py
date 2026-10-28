@@ -138,9 +138,9 @@ def convert_bytes(data: bytes, *, reverse: bool = False) -> tuple[bytes, SaveKin
     kind = codec.detect_kind(data)
     if kind is SaveKind.UNKNOWN:
         raise UnknownMagicError(
-            f"Неизвестный magic {codec.format_magic(data)}",
-            hint="Ожидался GVAS (0x53415647) или обфусцированный файл (0x0B650015). "
-            "Похоже, это не сохранение Persona 3 Reload.",
+            f"Это не сохранение P3R: первые байты {codec.format_magic(data)}",
+            hint="Ожидался GVAS (0x53415647) или обфускация Steam (0x0B650015). "
+            f"Начало файла: {data[:16].hex(' ')}",
         )
     if len(data) < MIN_SAVE_SIZE:
         raise TransferError(
@@ -200,7 +200,7 @@ def convert_file(
         return result
 
     backup_dir = create_backup(out_dir) if backup else None
-    fsutil.write_bytes(target, payload)
+    fsutil.write_bytes_atomic(target, payload, min_size=codec.MIN_SAVE_SIZE)
     if fsutil.sha256_of(target) != hashlib.sha256(payload).hexdigest():
         raise TransferError(f"Запись не совпала с ожидаемыми байтами: {target}")
     log.info("Записано: %s (%d байт)", target, len(payload))
@@ -287,3 +287,14 @@ def verify_file(path: str | Path) -> VerifyReport:
     return VerifyReport(
         path=path, kind=kind, size=len(data), problems=problems, warnings=warnings, meta=meta
     )
+
+
+def ensure_free_space(out_dir: str | Path, total_bytes: int, *, margin: float = 0.10) -> None:
+    """Refuse to start a batch that cannot fit, instead of dying mid-way."""
+    needed = int(total_bytes * (1.0 + margin))
+    free = fsutil.free_space(out_dir)
+    if free and free < needed:
+        raise TransferError(
+            f"Недостаточно места в {Path(out_dir)}: нужно {fsutil.human_size(needed)}, "
+            f"свободно {fsutil.human_size(free)}"
+        )

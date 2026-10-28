@@ -342,6 +342,8 @@ class App:
         self.run_items: list[dict] = []
         self.run_rows: dict[str, RunRow] = {}
         self.last_summary: dict | None = None
+        self.skipped: list[dict] = []
+        self.metadata_count = 0
         self._cancel = threading.Event()
         self._queue: queue.Queue = queue.Queue()
         self._worker: threading.Thread | None = None
@@ -379,10 +381,13 @@ class App:
         logging.getLogger().setLevel(logging.INFO)
         self._bind_hotkeys()
         self.root.after_idle(self._startup_probe)
+        # First scan runs now (the scan itself happens on a worker thread, so the
+        # window is already painted).  A delayed timer here used to race with an
+        # early click and wipe the freshly found list.
         if not self.source_path:
-            self.root.after(120, self.auto_find)
+            self.auto_find()
         else:
-            self.root.after(120, lambda: self.load_source(self.source_path))
+            self.load_source(self.source_path)
 
     def _bind_hotkeys(self) -> None:
         self.root.bind_all("<Control-o>", self._hotkey_open)
@@ -730,6 +735,15 @@ class App:
             wraplength=self.m.px(620),
         )
         self.empty_body.pack(anchor="w", pady=(self.m.px(8), 0))
+        self.empty_log_btn = widgets.ShardButton(
+            self.empty_frame,
+            self.t("action.show_log"),
+            self.toggle_log,
+            kind="ghost",
+            m=self.m,
+            height=30,
+            padx=14,
+        )
         self.hint_label = tk.Label(
             body,
             text=self.t("table.hint"),
@@ -1044,6 +1058,18 @@ class App:
         block("files", mono=True)
         block("warn", theme.PINK)
 
+        about = tk.Label(
+            content,
+            text=self.t("help.about", version=__version__),
+            font=fonts.text(self.root, self.m.px(10)),
+            fg=theme.DIM,
+            bg=theme.PANEL,
+            anchor="w",
+            justify="left",
+            wraplength=self.m.px(380),
+        )
+        about.pack(anchor="w", pady=(self.m.px(16), 0))
+
         self.btn_help_close = widgets.ShardButton(
             content,
             self.t("help.close"),
@@ -1251,7 +1277,9 @@ class App:
                 "run.failed", converted=summary.get("converted", 0), failed=summary["failed"]
             )
         return self.t(
-            "run.summary", converted=summary.get("converted", 0), skipped=summary.get("skipped", 0)
+            "run.summary",
+            converted=summary.get("converted", 0),
+            skipped=summary.get("skipped", len(self.skipped)),
         )
 
     # --------------------------------------------------------------- commands
@@ -1416,7 +1444,11 @@ class App:
             self._log(f"! {result.get('error')}")
             return
         self.saves = result.get("saves", [])
+        self.skipped = result.get("skipped", []) or []
+        self.metadata_count = int(result.get("metadata", 0) or 0)
         self.selected = {item["path"] for item in self.saves}
+        if self.skipped:
+            self._log(f"пропущено файлов: {len(self.skipped)}")
         self.source_path = result.get("source", self.source_path)
         self._remember(source=self.source_path)
         self._render_saves()
@@ -1461,7 +1493,20 @@ class App:
             return
         if not self.saves:
             self.scroll.place_forget()
-            self._show_empty(self.t("table.empty_title"), self.t("table.empty_body"))
+            if self.skipped:
+                reasons: dict[str, int] = {}
+                for item in self.skipped:
+                    key = str(item.get("reason", "?"))
+                    reasons[key] = reasons.get(key, 0) + 1
+                listing = "\n".join(
+                    f"{reason}: {count}" for reason, count in sorted(reasons.items())
+                )
+                self._show_empty(
+                    self.t("table.empty_title"),
+                    self.t("table.empty_skipped", count=len(self.skipped), reasons=listing),
+                )
+            else:
+                self._show_empty(self.t("table.empty_title"), self.t("table.empty_body"))
             return
         self._show_scroll()
         width = max(self.m.px(600), self.scroll.canvas.winfo_width())
@@ -1473,7 +1518,47 @@ class App:
         self.root.update_idletasks()
         for row in self._save_rows:
             row.place_badge(max(1, row.winfo_width()))
+        self._render_skipped(width)
         self.scroll.refresh()
+
+    def _render_skipped(self, width: int) -> None:
+        """Dimmed "Пропущено (N)" block under the list; never an error state."""
+        if not self.skipped:
+            return
+        header = tk.Label(
+            self.scroll.inner,
+            text=self.t("table.skipped_title", count=len(self.skipped)),
+            font=fonts.medium(self.root, self.m.px(11)),
+            fg=theme.DIM,
+            bg=theme.PANEL,
+            anchor="w",
+        )
+        header.configure(width=1)
+        header.pack(fill="x", pady=(self.m.px(14), self.m.px(4)))
+        for item in self.skipped[:40]:
+            label = tk.Label(
+                self.scroll.inner,
+                text=self.t(
+                    "table.skipped_row", name=item.get("name", "?"), reason=item.get("reason", "")
+                ),
+                font=fonts.text(self.root, self.m.px(11)),
+                fg=theme.DIM,
+                bg=theme.PANEL,
+                anchor="w",
+                justify="left",
+                wraplength=max(self.m.px(400), width - self.m.px(40)),
+            )
+            label.pack(fill="x")
+        if len(self.skipped) > 40:
+            more = tk.Label(
+                self.scroll.inner,
+                text=self.t("table.skipped_more", count=len(self.skipped) - 40),
+                font=fonts.text(self.root, self.m.px(11)),
+                fg=theme.DIM,
+                bg=theme.PANEL,
+                anchor="w",
+            )
+            more.pack(fill="x")
 
     def _show_scroll(self) -> None:
         self._layout_list_body()
@@ -1481,6 +1566,10 @@ class App:
     def _show_empty(self, title: str, body: str) -> None:
         self.empty_title.configure(text=title)
         self.empty_body.configure(text=body)
+        if self.skipped:
+            self.empty_log_btn.pack(anchor="w", pady=(self.m.px(12), 0))
+        else:
+            self.empty_log_btn.pack_forget()
         self.empty_frame.place(relx=0.5, rely=0.5, anchor="center")
 
     # --- convert -----------------------------------------------------------
@@ -1906,6 +1995,9 @@ class App:
             self._poll_job = None
         if self.mode in {"scan", "run"}:
             self._cancel.set()
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=2.0)  # do not leak a thread into the next window
         self._drop.detach()
         if self.cfg is not None:
             self.cfg.values.update(

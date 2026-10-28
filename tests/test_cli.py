@@ -46,7 +46,7 @@ def test_scan_human_output(tmp_path, monkeypatch, capsys):
     wgs, _ = build_env(tmp_path, monkeypatch)
     code, out, err = run(["scan", "--wgs", str(wgs)], capsys)
     assert code == 0, err
-    assert "Найдено сохранений: 1" in out
+    assert "Сохранений: 1 (GVAS 1, Steam 0)" in out
     assert "уровень 12" in out
     assert "время 3:00:00" in out
     assert "сложность Normal" in out
@@ -58,8 +58,8 @@ def test_scan_json_output(tmp_path, monkeypatch, capsys):
     code, out, _ = run(["scan", "--wgs", str(wgs), "--json"], capsys)
     assert code == 0
     payload = json.loads(out)
-    assert len(payload) == 1
-    record = payload[0]
+    assert payload["counts"]["saves"] == 1
+    record = payload["saves"][0]
     assert record["kind"] == "gvas"
     assert record["container_guid"] == CONTAINER
     assert record["user_id"] == USER_ID
@@ -73,8 +73,8 @@ def test_scan_empty_tree(tmp_path, monkeypatch, capsys):
     for path in sorted(wgs.rglob("C8F1A2B3D4E5F60718293A4B5C6D7E80")):
         path.unlink()
     code, out, _ = run(["scan", "--wgs", str(wgs)], capsys)
-    assert code == 0
-    assert "Найдено сохранений: 0" in out
+    assert code == 3
+    assert "Сохранений: 0 (GVAS 0, Steam 0)" in out
 
 
 def test_scan_missing_root_exits_nonzero(tmp_path, monkeypatch, capsys):
@@ -90,9 +90,9 @@ def test_scan_unknown_magic_is_shown_in_hex(tmp_path, monkeypatch, capsys):
     leaf.mkdir(parents=True)
     (leaf / "junk.bin").write_bytes(b"JUNK" + b"\x00" * 64)
     code, out, _ = run(["scan", "--wgs", str(wgs)], capsys)
-    assert code == 0
+    assert code == 3
     assert "0x4B4E554A" in out
-    assert "неизвестный" in out
+    assert "not-a-save" in out
 
 
 def test_convert_command(tmp_path, monkeypatch, capsys):
@@ -153,7 +153,7 @@ def test_convert_all_reports_table(tmp_path, monkeypatch, capsys):
     out_dir = tmp_path / "out"
     code, out, err = run(["convert-all", "--wgs", str(wgs), "--out-dir", str(out_dir)], capsys)
     assert code == 0, err
-    assert "Успешно: 2 из 2" in out
+    assert "Сконвертировано 2, пропущено 0." in out
     assert "SaveData001.sav" in out
     assert (out_dir / "SaveData001.sav").exists()
     assert (out_dir / "SaveData002.sav").exists()
@@ -168,7 +168,7 @@ def test_convert_all_json(tmp_path, monkeypatch, capsys):
     )
     assert code == 0
     payload = json.loads(out)
-    assert payload[0]["status"] == "ok"
+    assert payload["files"][0]["status"] == "ok"
 
 
 def test_convert_all_empty_tree(tmp_path, monkeypatch, capsys):
@@ -176,7 +176,7 @@ def test_convert_all_empty_tree(tmp_path, monkeypatch, capsys):
     code, _, err = run(
         ["convert-all", "--wgs", str(wgs), "--out-dir", str(tmp_path / "out")], capsys
     )
-    assert code == 1
+    assert code == 3
     assert "не найдено" in err
 
 
@@ -309,7 +309,7 @@ def test_russian_output_survives_cp866_stream(tmp_path, monkeypatch):
         text = raw.getvalue().decode("utf-8")
     finally:
         monkeypatch.undo()
-    assert "Найдено сохранений: 1" in text
+    assert "Сохранений: 1" in text
 
 
 def test_russian_output_survives_utf8_stream(tmp_path, monkeypatch):

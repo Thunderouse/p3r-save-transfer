@@ -113,11 +113,13 @@ class Bridge:
         """Find saves in a folder, a wgs tree or a single file."""
         target = Path(path) if path else discovery.default_wgs_root()
 
+        skipped: list[dict] = []
+        metadata = 0
         if target.is_file():
             records = [self._single_file(target)]
             source_kind = "file"
         elif target.is_dir():
-            records, source_kind = self._scan_dir(target)
+            records, skipped, metadata, source_kind = self._scan_dir(target)
         else:
             raise TransferError(
                 f"Путь не найден: {target}",
@@ -130,13 +132,16 @@ class Bridge:
             self._record_payload(record, slot)
             for record, slot in zip(ordered, slots, strict=False)
         ]
-        self._log(f"scan: {target} -> {len(payload)}")
+        self._log(f"scan: {target} -> {len(payload)} сохранений, {len(skipped)} пропущено")
         return {
             "ok": True,
             "source": str(target),
             "source_kind": source_kind,
             "saves": payload,
             "count": len(payload),
+            "skipped": skipped,
+            "metadata": metadata,
+            "skipped_count": len(skipped),
         }
 
     def _single_file(self, target: Path) -> discovery.SaveRecord:
@@ -144,8 +149,9 @@ class Bridge:
         kind = codec.detect_kind(data)
         if kind is SaveKind.UNKNOWN:
             raise TransferError(
-                f"Неизвестный magic {codec.format_magic(data)} у файла {target.name}",
-                hint="Это не сохранение Persona 3 Reload (ни GVAS, ни обёртка Steam).",
+                f"Это не сохранение P3R: первые байты {codec.format_magic(data)}",
+                hint="Ожидался GVAS (0x53415647) или обфускация Steam (0x0B650015). "
+                f"Начало файла: {data[:16].hex(' ')}",
             )
         plain = codec.decrypt(data) if kind is SaveKind.OBFUSCATED else data
         from p3r_transfer.meta import read_metadata
@@ -160,8 +166,14 @@ class Bridge:
             magic=codec.magic_of(data),
         )
 
-    def _scan_dir(self, target: Path) -> tuple[list[discovery.SaveRecord], str]:
-        """Steam root (folders named after SteamID64) or a wgs-style tree."""
+    def _scan_dir(
+        self, target: Path
+    ) -> tuple[list[discovery.SaveRecord], list[dict], int, str]:
+        """Steam root (folders named after SteamID64) or a wgs-style tree.
+
+        Foreign files come back in the second value instead of raising: a user
+        folder with notes or ``desktop.ini`` is normal, not a failure.
+        """
         steam_ids = [p for p in target.iterdir() if p.is_dir() and p.name.isdigit()]
         looks_like_steam = any(
             child.name.lower().startswith("savedata")
@@ -169,8 +181,23 @@ class Bridge:
             for child in folder.iterdir()
         )
         if steam_ids and looks_like_steam:
-            return list(discovery.iter_steam_saves(target)), "steam"
-        return list(discovery.iter_wgs_saves(target)), "wgs"
+            result = discovery.scan_steam(target)
+            kind = "steam"
+        else:
+            result = discovery.scan_tree(target)
+            kind = "wgs"
+        skipped = [
+            {
+                "name": item.path.name,
+                "path": str(item.path),
+                "reason": item.reason,
+                "detail": item.detail or "",
+                "size": item.size,
+                "magic": None if item.magic is None else f"0x{item.magic:08X}",
+            }
+            for item in result.skipped
+        ]
+        return result.saves, skipped, result.metadata_files, kind
 
     @staticmethod
     def _order(records: Iterable[discovery.SaveRecord]) -> list[discovery.SaveRecord]:

@@ -89,15 +89,16 @@ def test_iter_wgs_saves_skips_service_and_empty_files(fake_env):
     assert len(list(discovery.iter_wgs_saves(wgs))) == 1
 
 
-def test_iter_wgs_saves_reports_unknown_magic(fake_env):
+def test_scan_tree_reports_unknown_magic_as_skipped(fake_env):
     local, _ = fake_env
     wgs = make_wgs_tree(local)
     leaf = next(wgs.rglob("C8F1A2B3D4E5F60718293A4B5C6D7E8F")).parent
     (leaf / "weird.bin").write_bytes(b"XXXX" + b"\x00" * 64)
-    records = list(discovery.iter_wgs_saves(wgs))
-    assert len(records) == 2
-    unknown = [r for r in records if r.kind is SaveKind.UNKNOWN]
-    assert unknown and unknown[0].magic == 0x58585858
+    result = discovery.scan_tree(wgs)
+    assert len(result.saves) == 1
+    skipped = {item.path.name: item for item in result.skipped}
+    assert skipped["weird.bin"].reason == discovery.SKIP_NOT_A_SAVE
+    assert skipped["weird.bin"].magic == 0x58585858
 
 
 def test_steam_tree_and_slots(fake_env):

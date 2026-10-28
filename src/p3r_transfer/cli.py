@@ -23,6 +23,22 @@ log = logging.getLogger("p3r_transfer")
 
 STATUS_LABELS = {"ok": "ок", "dry-run": "пробный прогон"}
 
+#: Exit codes are public API (README, --help, tests).
+EXIT_OK = 0
+EXIT_FATAL = 1
+EXIT_USAGE = 2
+EXIT_PARTIAL = 3
+
+REASON_LABELS = {
+    discovery.SKIP_NOT_A_SAVE: "не сохранение",
+    discovery.SKIP_EMPTY: "пустой файл",
+    discovery.SKIP_OS_JUNK: "служебный файл ОС",
+    discovery.SKIP_TEMP_FILE: "временный файл",
+    discovery.SKIP_UNREADABLE: "не читается",
+    discovery.SKIP_TOO_LARGE: "слишком большой",
+    discovery.SKIP_NO_ACCESS: "нет доступа",
+}
+
 
 # ------------------------------------------------------------------ formatting
 
@@ -67,10 +83,21 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def _record_json(record: discovery.SaveRecord) -> dict:
+def _relative(path: Path, root: Path | None) -> str:
+    """Path relative to the scanned root - safe to paste into an issue."""
+    if root is not None:
+        try:
+            return path.relative_to(root).as_posix()
+        except ValueError:
+            pass
+    return path.name
+
+
+def _record_json(record: discovery.SaveRecord, root: Path | None = None) -> dict:
     meta = record.meta
     return {
-        "path": str(record.path),
+        "path": _relative(record.path, root),
+        "category": record.category,
         "size": record.size,
         "kind": record.kind.value,
         "container_guid": record.container_guid,
@@ -124,36 +151,165 @@ def _print_result(result: convert.ConversionResult) -> None:
 # -------------------------------------------------------------------- commands
 
 
+def _file_label(path: Path, root: Path | None) -> str:
+    """Just the file name - the GUID folders are noise in a summary table."""
+    return path.name
+
+
+def _skipped_rows(items: list[discovery.SkippedFile], root: Path | None) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for item in items:
+        rows.append(
+            [
+                _file_label(item.path, root),
+                item.reason,
+                fsutil.human_size(item.size) if item.size else "-",
+                item.detail or REASON_LABELS.get(item.reason, ""),
+            ]
+        )
+    return rows
+
+
+def _print_skipped(items: list[discovery.SkippedFile], root: Path | None) -> None:
+    if not items:
+        return
+    print()
+    print(f"Пропущено ({len(items)}):")
+    print(_table(["Файл", "Причина", "Размер", "Пояснение"], _skipped_rows(items, root)))
+
+
+def _skipped_json(items: list[discovery.SkippedFile], root: Path | None) -> list[dict]:
+    return [
+        {
+            "path": _relative(item.path, root),
+            "category": discovery.CATEGORY_SKIPPED,
+            "reason": item.reason,
+            "size": item.size,
+            "detail": item.detail,
+            "magic": None if item.magic is None else f"0x{item.magic:08X}",
+        }
+        for item in items
+    ]
+
+
+def _counts_json(result: discovery.ScanResult) -> dict:
+    gvas = sum(1 for record in result.saves if record.kind is SaveKind.GVAS)
+    return {
+        "saves": len(result.saves),
+        "save_gvas": gvas,
+        "save_steam": len(result.saves) - gvas,
+        "skipped": len(result.skipped),
+        "metadata": result.metadata_files,
+        "by_reason": result.reason_counts(),
+    }
+
+
+def explain_file(path: str | Path) -> int:
+    """Print why a file is or is not treated as a save."""
+    target = Path(path)
+    if not target.exists():
+        raise TransferError(f"Файл не найден: {target}")
+    if target.is_dir():
+        raise TransferError(f"Это каталог, а не файл: {target}")
+    verdict = discovery.inspect_file(target)
+    print(f"Файл:    {target}")
+    try:
+        size = target.stat().st_size
+    except OSError:
+        size = 0
+    print(f"Размер:  {_size_pair(size)}")
+    head = b""
+    try:
+        head = fsutil.read_head(target, 16)
+    except TransferError as exc:
+        print(f"Заголовок: не читается ({exc.message})")
+    if head:
+        print(f"Magic:   {codec.format_magic(head)}")
+        print(f"Первые 16 байт: {head.hex(' ')}")
+    if verdict is None:
+        print("Категория: metadata (служебный файл Xbox, не сохранение)")
+        return EXIT_OK
+    if isinstance(verdict, discovery.SaveRecord):
+        print(f"Категория: {verdict.category} ({verdict.kind_label})")
+        print(f"Метаданные: {_meta_summary(verdict.meta)}")
+        print("Решение: конвертировать")
+        return EXIT_OK
+    print(f"Категория: {discovery.CATEGORY_SKIPPED} ({verdict.reason})")
+    print(f"Пояснение: {verdict.detail or REASON_LABELS.get(verdict.reason, '')}")
+    print("Решение: пропустить")
+    return EXIT_OK
+
+
+def cmd_explain(args: argparse.Namespace) -> int:
+    return explain_file(args.file)
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
+    if getattr(args, "explain", None):
+        return explain_file(args.explain)
+
     root = discovery.resolve_wgs_root(args.wgs)
-    records = list(discovery.iter_wgs_saves(root))
+    result = discovery.scan_tree(root, include_skipped=args.include_skipped)
     if args.steam:
         try:
             steam_root = discovery.resolve_steam_root(args.steam_root)
         except SteamDirNotFoundError as exc:
             print(f"Внимание: {exc}", file=sys.stderr)
         else:
-            records.extend(discovery.iter_steam_saves(steam_root))
-    records.sort(key=lambda record: (record.mtime, str(record.path)))
+            result.extend(
+                discovery.scan_steam(steam_root, include_skipped=args.include_skipped)
+            )
+    result.saves.sort(key=lambda record: (record.mtime, str(record.path)))
 
     if args.json:
-        print(json.dumps([_record_json(r) for r in records], ensure_ascii=False, indent=2))
-        return 0
-
-    print(f"Каталог wgs: {root}")
-    print(f"Найдено сохранений: {len(records)}")
-    if not records:
         print(
-            "Пусто. Запустите игру из Microsoft Store хотя бы раз, чтобы сохранения "
-            "появились на диске (облачные сохранения сначала нужно скачать)."
+            json.dumps(
+                {
+                    "version": __version__,
+                    "root": str(root),
+                    "counts": _counts_json(result),
+                    "saves": [_record_json(record, root) for record in result.saves],
+                    "skipped": _skipped_json(result.skipped, root),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
         )
-        return 0
-    print()
-    for index, record in enumerate(records, start=1):
-        _print_record(index, len(records), record)
-        if index != len(records):
+    else:
+        counts = _counts_json(result)
+        print(f"Каталог wgs: {root}")
+        print(
+            f"Сохранений: {counts['saves']} "
+            f"(GVAS {counts['save_gvas']}, Steam {counts['save_steam']}), "
+            f"пропущено: {counts['skipped']}, служебных файлов: {counts['metadata']}"
+        )
+        if result.saves:
             print()
-    return 0
+            for index, record in enumerate(result.saves, start=1):
+                _print_record(index, len(result.saves), record)
+                if index != len(result.saves):
+                    print()
+        elif not result.skipped:
+            print(
+                "Пусто. Запустите игру из Microsoft Store хотя бы раз, чтобы сохранения "
+                "появились на диске (облачные сохранения сначала нужно скачать)."
+            )
+        _print_skipped(result.skipped, root)
+
+    if args.strict and result.skipped:
+        print(
+            f"Строгий режим: пропущено {len(result.skipped)} файл(ов), это ошибка.",
+            file=sys.stderr,
+        )
+        return EXIT_FATAL
+    if not result.saves:
+        print(
+            f"Сохранений не найдено, пропущено {len(result.skipped)} файл(ов) "
+            f"({result.reason_summary() or 'файлов нет'}).",
+            file=sys.stderr,
+        )
+        return EXIT_PARTIAL
+    return EXIT_OK
 
 
 def cmd_convert(args: argparse.Namespace) -> int:
@@ -190,15 +346,31 @@ def cmd_convert(args: argparse.Namespace) -> int:
 
 def cmd_convert_all(args: argparse.Namespace) -> int:
     root = discovery.resolve_wgs_root(args.wgs)
-    records = list(discovery.iter_wgs_saves(root))
-    if not records:
-        raise TransferError(
-            "В каталоге wgs не найдено ни одного сохранения",
-            hint="Проверьте --wgs или запустите игру, чтобы сохранения появились на диске.",
+    result = discovery.scan_tree(root, include_skipped=args.include_skipped)
+
+    if args.strict and result.skipped:
+        print(f"Источник: {root}")
+        _print_skipped(result.skipped, root)
+        print(
+            f"Строгий режим: пропущено {len(result.skipped)} файл(ов), ничего не записано.",
+            file=sys.stderr,
         )
+        return EXIT_FATAL
+
+    if not result.saves:
+        print(
+            f"Сохранений не найдено в {root}, пропущено {len(result.skipped)} файл(ов) "
+            f"({result.reason_summary() or 'нет файлов'}).",
+            file=sys.stderr,
+        )
+        _print_skipped(result.skipped, root)
+        return EXIT_PARTIAL
 
     out_dir = Path(args.out_dir)
-    plan = convert.plan_slots(records, out_dir, force=args.force)
+    if not args.dry_run:
+        convert.ensure_free_space(out_dir, sum(record.size for record in result.saves))
+
+    plan = convert.plan_slots(result.saves, out_dir, force=args.force)
 
     backup_dir = None
     if not args.dry_run and not args.no_backup:
@@ -209,7 +381,7 @@ def cmd_convert_all(args: argparse.Namespace) -> int:
     payload: list[dict] = []
     for record, slot in plan:
         try:
-            result = convert.convert_file(
+            result_one = convert.convert_file(
                 record.path,
                 out_dir,
                 slot=slot,
@@ -229,37 +401,61 @@ def cmd_convert_all(args: argparse.Namespace) -> int:
                 ]
             )
             payload.append(
-                {"source": str(record.path), "slot": slot, "status": "error", "error": str(exc)}
+                {
+                    "source": str(record.path),
+                    "slot": slot,
+                    "status": "error",
+                    "error": str(exc),
+                }
             )
             continue
         rows.append(
             [
                 record.path.name,
-                str(result.slot),
-                result.target.name if result.target else "-",
-                fsutil.human_size(result.size),
-                STATUS_LABELS.get(result.status, result.status),
+                str(result_one.slot),
+                result_one.target.name if result_one.target else "-",
+                fsutil.human_size(result_one.size),
+                STATUS_LABELS.get(result_one.status, result_one.status),
             ]
         )
         payload.append(
             {
-                "source": str(result.source),
-                "target": str(result.target) if result.target else None,
-                "slot": result.slot,
-                "size": result.size,
-                "status": result.status,
+                "source": str(result_one.source),
+                "target": str(result_one.target) if result_one.target else None,
+                "slot": result_one.slot,
+                "size": result_one.size,
+                "status": result_one.status,
             }
         )
 
+    converted = len(plan) - failures
+    skipped_count = len(result.skipped)
     if args.json:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {
+                    "version": __version__,
+                    "source": str(root),
+                    "destination": str(out_dir),
+                    "converted": converted,
+                    "failed": failures,
+                    "skipped": _skipped_json(result.skipped, root),
+                    "files": payload,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     else:
         print(f"Источник: {root}")
         print(f"Цель:     {out_dir}")
         print()
         print(_table(["Файл", "Слот", "Результат", "Размер", "Статус"], rows))
         print()
-        print(f"Успешно: {len(plan) - failures} из {len(plan)}")
+        print(f"Сконвертировано {converted}, пропущено {skipped_count}.")
+        if failures:
+            print(f"Не удалось обработать: {failures}.")
+        _print_skipped(result.skipped, root)
         if backup_dir:
             print(f"Бэкап: {backup_dir}")
         if args.dry_run:
@@ -268,7 +464,7 @@ def cmd_convert_all(args: argparse.Namespace) -> int:
             "Номера слотов назначены по возрастанию игрового времени: "
             "слот 1 - самое старое сохранение."
         )
-    return 1 if failures else 0
+    return EXIT_PARTIAL if (failures or skipped_count) else EXIT_OK
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -350,8 +546,9 @@ def cmd_install(args: argparse.Namespace) -> int:
         note = "вход уже в формате Steam, скопирован как есть"
     else:
         raise TransferError(
-            f"Неизвестный magic {codec.format_magic(data)}",
-            hint="Ожидался GVAS или обфусцированный файл Steam.",
+            f"Это не сохранение P3R: первые байты {codec.format_magic(data)}",
+            hint="Ожидался GVAS (0x53415647) или обфускация Steam (0x0B650015). "
+            f"Начало файла: {data[:16].hex(' ')}",
         )
     if len(data) < codec.MIN_SAVE_SIZE:
         raise TransferError(f"Файл слишком мал: {len(data)} байт")
@@ -376,7 +573,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     if conflict and not args.no_backup:
         backup_dir = convert.create_backup(account, files=[target])
         print(f"Бэкап:   {backup_dir}")
-    fsutil.write_bytes(target, payload)
+    fsutil.write_bytes_atomic(target, payload, min_size=codec.MIN_SAVE_SIZE)
     if fsutil.sha256_of(target) != hashlib.sha256(payload).hexdigest():
         raise TransferError(f"Запись не совпала с ожидаемыми байтами: {target}")
     print("Готово. Запустите игру и проверьте слот в списке загрузки.")
@@ -402,6 +599,13 @@ def build_parser() -> argparse.ArgumentParser:
             "--out-dir .\\out --dry-run\n"
             "  p3r-save-transfer verify SaveData001.sav\n"
             "  p3r-save-transfer install --in SaveData001.sav --slot 1\n"
+            "  p3r-save-transfer explain notes.txt\n"
+            "\n"
+            "Коды возврата:\n"
+            "  0 - всё обработано, пропусков нет\n"
+            "  1 - фатальная ошибка (нет каталога, нет прав, указанный файл не сохранение)\n"
+            "  2 - неверные аргументы\n"
+            "  3 - частичный успех: что-то сконвертировано, что-то пропущено\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -416,6 +620,15 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--steam", action="store_true", help="показать также сохранения Steam")
     scan.add_argument("--steam-root", help="каталог Steam (по умолчанию из %%APPDATA%%)")
     scan.add_argument("--json", action="store_true", help="машиночитаемый вывод")
+    scan.add_argument(
+        "--strict", action="store_true", help="любой пропущенный файл считать ошибкой"
+    )
+    scan.add_argument(
+        "--include-skipped",
+        action="store_true",
+        help="показывать файлы с незнакомым magic как кандидатов",
+    )
+    scan.add_argument("--explain", metavar="FILE", help="объяснить решение по одному файлу")
     scan.set_defaults(func=cmd_scan)
 
     one = sub.add_parser("convert", help="конвертировать один файл")
@@ -442,7 +655,19 @@ def build_parser() -> argparse.ArgumentParser:
     every.add_argument("--dry-run", action="store_true", help="только показать план")
     every.add_argument("--no-backup", action="store_true", help="не создавать бэкап")
     every.add_argument("--json", action="store_true", help="машиночитаемый вывод")
+    every.add_argument(
+        "--strict", action="store_true", help="любой пропущенный файл считать ошибкой"
+    )
+    every.add_argument(
+        "--include-skipped",
+        action="store_true",
+        help="пытаться конвертировать даже файлы с незнакомым magic",
+    )
     every.set_defaults(func=cmd_convert_all)
+
+    explain = sub.add_parser("explain", help="показать, почему файл считается сохранением")
+    explain.add_argument("file", help="файл для проверки")
+    explain.set_defaults(func=cmd_explain)
 
     check = sub.add_parser("verify", help="проверить magic, размер и round-trip")
     check.add_argument("files", nargs="+", help="файлы для проверки")
