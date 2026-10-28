@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest a command, a flag or a behaviour
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The 1.x line keeps the CLI, the JSON fields and `config.json` stable, so
+        new flags are easier to accept than renames. Please keep it to the
+        converter itself: no save editing, no achievement transfer, no
+        installer, no telemetry.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you would like to see
+      description: A command line, a flag, a label - as concrete as you can
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do today instead
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This does not require editing save contents (levels, money, personas)
+          required: true
+        - label: This does not need network access, an installer or admin rights
+          required: true

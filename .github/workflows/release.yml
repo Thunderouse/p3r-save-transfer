@@ -84,11 +84,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 1.0.0-rc1 is a pre-release, 1.0.0 is not: the version decides.
+          $flags = @()
+          if ($env:VERSION.Contains("-")) { $flags += "--prerelease" }
           gh release create "$env:GITHUB_REF_NAME" `
             "$env:ZIP_PATH" `
             "$env:SHA_PATH" `
             --verify-tag `
-            --prerelease `
+            @flags `
             --title "P3R Save Transfer Tool $env:VERSION" `
             --notes-file notes.md
           gh release view "$env:GITHUB_REF_NAME" --json tagName,name,isPrerelease,assets,url

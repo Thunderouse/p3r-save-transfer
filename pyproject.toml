@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "p3r-save-transfer"
-version = "0.1.0-beta"
-description = "Convert Persona 3 Reload saves from Xbox / Microsoft Store to the Steam version. Windows portable app. Beta."
+version = "1.0.0-rc1"
+description = "Convert Persona 3 Reload saves from Xbox / Microsoft Store to the Steam version. Windows portable app."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

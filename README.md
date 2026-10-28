@@ -27,6 +27,14 @@ Steam:     SaveDataNNN.sav  0B 65 00 15 ...    (same container, obfuscated)
 
 ![Conversion finished](docs/screenshots/gui-success.png)
 
+## Support matrix
+
+| Platform | Status |
+|---|---|
+| Windows 10 21H2 or newer, x64 | supported |
+| Windows 11, x64 | supported |
+| Windows on ARM, Windows 7/8, Linux, macOS, consoles | not supported |
+
 ## Requirements
 
 - Windows 10 or Windows 11, x64
@@ -106,14 +114,16 @@ From source, `py -3 -m pip install .` gives the `p3r-save-transfer` command.
 
 | Command | What it does |
 |---|---|
-| `scan [--wgs PATH] [--json] [--steam]` | find saves, show slot, date, level, play time, size, type |
-| `convert --in FILE --out-dir DIR [--slot N] [--reverse] [--dry-run] [--force]` | convert one file |
-| `convert-all --wgs PATH --out-dir DIR [--dry-run] [--force]` | convert everything found |
+| `scan [--wgs PATH] [--json] [--steam] [--strict] [--include-skipped] [--explain FILE]` | find saves, show slot, date, level, play time, size, type, and what was skipped |
+| `convert --in FILE --out-dir DIR [--slot N] [--reverse] [--dry-run] [--force]` | convert one file (a foreign file is an error here) |
+| `convert-all --wgs PATH --out-dir DIR [--dry-run] [--force] [--strict] [--include-skipped] [--json]` | convert everything valid, list the rest |
 | `verify FILE...` | check magic, size and a byte-exact round-trip |
-| `install --in FILE --slot N [--steam-id ID]` | copy straight into the Steam profile |
+| `install --in FILE --slot N [--steam-id ID] [--force]` | copy straight into the Steam profile |
+| `explain FILE` | print the magic, size, first 16 bytes and the resulting decision |
 
-Exit codes: `0` success, `1` problem (locked file, busy slot, failed check),
-`2` bad arguments.
+`--json` is meant for scripts: the top level is an object, and paths are
+relative to `root`, so the output can be pasted into a bug report. See
+[Stability](#stability) for the exact field list and [Exit codes](#exit-codes).
 
 ## How it works
 
@@ -130,16 +140,98 @@ byte-for-byte operation - and the tool proves it: before writing anything it
 applies the opposite transform to the result and compares it with the input.
 `p3r-save-transfer verify` exposes the same check for any file.
 
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Everything requested was processed; no skipped files |
+| `1` | Fatal: folder missing, no permission, or the file you named is not a save |
+| `2` | Usage error (bad arguments) |
+| `3` | Partial: something was converted and something was skipped - or nothing valid was found at all |
+
+`--dry-run` follows the same rules, so a dry run over a folder with junk also
+returns `3`.
+
+## Why a file was skipped
+
+A save folder is a normal folder. `scan` and `convert-all` classify every file
+and never abort because of one of them. The reason codes are stable and appear
+in the text output, in `--json` and in the GUI:
+
+| Reason | Meaning |
+|---|---|
+| `not-a-save` | Magic is neither `GVAS` (`0x53415647`) nor the Steam wrapper (`0x0B650015`) |
+| `empty` | Zero-byte file |
+| `os-junk` | `desktop.ini`, `Thumbs.db`, `.DS_Store`, `~$*`, dotfiles |
+| `temp-file` | `*.tmp`, `*.bak`, `*.part`, `*.crdownload`, `*.download` |
+| `unreadable` | No permission or the file is held open by another program |
+| `too-large` | Bigger than 32 MB - not a P3R save, and never read into memory |
+| `no-access` | The folder itself cannot be read |
+
+`container.*` files from the Microsoft Store container are counted as
+`metadata` instead of being reported as a problem.
+
+Use `--strict` to turn any skip into an error, `--include-skipped` to attempt
+the files with an unknown magic anyway, and `explain <file>` to see the magic,
+the size and the first 16 bytes behind the decision.
+
 ## Troubleshooting
 
-| Symptom | What to do |
-|---|---|
-| `File is locked or unavailable` | Close the game and the Xbox app, wait a few seconds, retry. |
-| `wgs folder not found` | The Microsoft Store version was never launched on this PC, or `LOCALAPPDATA` points to another drive. Pass `--wgs` or pick the folder manually. |
-| `Unknown magic 0x...` | The file is not a P3R save (or it is a `container.*` service file). |
-| `Slot N is already taken` | Use the suggested free slot, or allow overwriting (`--force` creates a backup first). |
-| `n/a` in the metadata columns | That field could not be read for this save-game version. Conversion still works. |
-| Mojibake in a redirected file | The CLI writes UTF-8 when output is redirected; open the file in a UTF-8 editor or run `chcp 65001` first. |
+| Symptom | Cause | What to do |
+|---|---|---|
+| `This is not a P3R save: first bytes 0x...` | The file you named explicitly has a foreign magic | Check the path; the full hex of the first 16 bytes is printed |
+| `File is locked or unavailable` (`unreadable`) | The game or the Xbox app holds the file | Close both, wait a few seconds, retry |
+| `wgs folder not found` | The Microsoft Store version never ran here, or `LOCALAPPDATA` is on another drive | Pass `--wgs` or pick the folder manually |
+| `Slot N is already taken` | The destination already has that slot | Use the suggested free slot, or `--force` (a backup is written first) |
+| `Nothing found, N files skipped` | Only junk and non-saves in the folder | Run `scan` to see the reasons, `explain` on a specific file |
+| `n/a` in the metadata columns | That field could not be read for this save-game version | Nothing to fix: conversion does not depend on metadata |
+| Mojibake in a redirected file | The CLI writes UTF-8 even when redirected | Open the file in a UTF-8 editor, or run `chcp 65001` first |
+| `Not enough space in ...` | The destination volume cannot hold the batch plus 10 % | Free space or choose another `--out-dir` |
+
+## Stability
+
+Release 1.0 freezes the contract. These are stable and only change in a major
+version:
+
+- **CLI**: command names (`scan`, `convert`, `convert-all`, `verify`, `install`,
+  `explain`), flag names and their defaults, and the exit codes above.
+- **JSON**: `scan --json` returns `version`, `root`, `counts`, `saves`,
+  `skipped`; `convert-all --json` returns `converted`, `failed`, `skipped`,
+  `files`. Fields may be **added**, never renamed or removed. Per-save fields
+  (`path`, `size`, `kind`, `slot`, `magic`, `mtime`, `meta`, ...) are unchanged
+  since 0.1.0-beta. `saves[].path` and `skipped[].path` are relative to `root`.
+- **`config.json`**: the six keys (`lang`, `source`, `destination`, `steam_id`,
+  `backup`, `dry_run`) are frozen. A 0.1.0-beta file is read by 1.0 without
+  errors and without migration.
+- **Version**: one place, `src/p3r_transfer/version.py`; a test fails when
+  `pyproject.toml` disagrees with it.
+
+Semantic versioning: a breaking change to the CLI or to `config.json` is a major
+release, new functionality is a minor release, fixes are patch releases. Nothing
+more is promised: internals, the GUI layout and the wording of messages may
+change in any release.
+
+## FAQ
+
+**Do achievements transfer?** No. Game Pass achievements stay in your Xbox
+profile; Steam achievements start from the moment the converted save is loaded.
+
+**My saves are only in the Xbox cloud.** Install the Microsoft Store version,
+launch it once with your own account and let it sync, then close it. The files
+appear under `%LOCALAPPDATA%\Packages\...\wgs`. The tool never logs into
+accounts and never downloads anything.
+
+**Does it work with Episode Aigis saves?** They are the same container, so the
+conversion path is identical. It has not been tested separately - treat it as
+the same save format.
+
+**Can I convert back to Microsoft Store?** `convert --reverse` produces a plain
+`GVAS` file for verification. Putting it back into a Live container needs the
+`container.*` bookkeeping file and is not automated.
+
+**What if a folder has my notes and screenshots in it?** Nothing happens to
+them. They are listed as skipped with a reason, and the save files are still
+converted.
 
 ## Known limitations
 
@@ -153,8 +245,10 @@ applies the opposite transform to the result and compares it with the input.
 - **Converting back** (`--reverse`) produces a plain `GVAS` file. This is meant for
   verification and manual experiments; the Microsoft Store layout also needs its
   `container.*` service file, so there is no automatic "install to Xbox".
-- **This is beta software** built and tested by one person on a limited set of
-  saves. Keep your own backups.
+- **Truncated saves are not detected.** The wrapper is byte-wise, so a file cut
+  short still round-trips. Only the game can reject it.
+- **Built and tested by one person** on a limited set of saves. Keep your own
+  backups even though the tool backs up the destination folder by default.
 
 ## Disclaimer
 

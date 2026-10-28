@@ -37,8 +37,11 @@ def test_pyproject_matches_the_code():
     )
 
 
-def test_version_is_the_beta_tag():
-    assert __version__ == "0.1.0-beta"
+def test_version_has_a_semver_shape():
+    core, _, pre = __version__.partition("-")
+    assert re.fullmatch(r"\d+\.\d+\.\d+", core), __version__
+    if pre:
+        assert re.fullmatch(r"(rc|beta)\.?\d*", pre), __version__
 
 
 def test_cli_and_gui_read_the_same_string(monkeypatch):

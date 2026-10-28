@@ -1,0 +1,73 @@
+name: Bug report
+description: Something crashed, converted wrongly or refused to convert
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **Do not attach save files, screenshots of your
+        Explorer, your Windows user name, a SteamID64 or `config.json`.**
+        `scan --json` already prints paths relative to the scanned folder - that
+        is the part we need.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: From the title bar, or `p3r-save-transfer-cli.exe --version`
+      placeholder: 1.0.0-rc1
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Windows version
+      description: winver -> e.g. "Windows 11 23H2, x64"
+      placeholder: Windows 11 23H2, x64
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where does it happen
+      options:
+        - GUI (P3R-Save-Transfer.exe)
+        - CLI (p3r-save-transfer-cli.exe)
+        - Both
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps
+      description: What you clicked or typed, in order
+      placeholder: |
+        1. Close the game and the Xbox app
+        2. Press "Find automatically"
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: The exact message. For a crash, the full text is welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: scan
+    attributes:
+      label: Output of `scan --json` (optional)
+      description: Paths are relative to the root you scanned; remove the "root" field if you prefer.
+      render: json
+  - type: textarea
+    id: listing
+    attributes:
+      label: Files in the save folder (optional)
+      description: File names, sizes and the first 16 bytes in hex (`explain <file>` prints them). No file contents.
+      render: text
