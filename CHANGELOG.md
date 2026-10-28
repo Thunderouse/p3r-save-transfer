@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-10-28
+
+Same code as `1.0.0-rc1`, promoted to a final release on request. The contract
+is frozen: CLI commands, flags, defaults and exit codes, the JSON fields of
+`scan --json` / `convert-all --json`, and the six keys of `config.json`.
+
 ## [1.0.0-rc1] - 2026-10-28
 
 First release candidate: the CLI surface, the JSON fields and `config.json` are
@@ -93,5 +99,6 @@ First public beta.
   manual experiments only.
 - The executables are unsigned, so Windows SmartScreen warns on first launch.
 
+[1.0.0]: https://github.com/Thunderouse/p3r-save-transfer/releases/tag/v1.0.0
 [1.0.0-rc1]: https://github.com/Thunderouse/p3r-save-transfer/releases/tag/v1.0.0-rc1
 [0.1.0-beta]: https://github.com/Thunderouse/p3r-save-transfer/releases/tag/v0.1.0-beta

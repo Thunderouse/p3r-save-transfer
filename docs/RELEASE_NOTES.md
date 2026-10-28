@@ -1,6 +1,6 @@
-Release candidate for **1.0**: a small Windows tool that converts **Persona 3
-Reload** save files from the Microsoft Store / Xbox Game Pass version to the
-Steam version. Unofficial, personal-project scale, no installer.
+Version **1.0**: a small Windows tool that converts **Persona 3 Reload** save
+files from the Microsoft Store / Xbox Game Pass version to the Steam version.
+Unofficial, personal-project scale, no installer.
 
 ## What is new in 1.0
 
@@ -92,8 +92,9 @@ migration is needed. Nothing else is written outside your user folders.
 ## What was not tested
 
 - This archive on a physical **Windows 10 / Windows 11 desktop**, and a retail
-  save loaded by the Steam build. That is exactly why this is a release
-  candidate and not 1.0.0.
+  save loaded by the Steam build - everything below was verified on CI runners
+  (Windows Server) with generated saves. Please treat the first real run as a
+  test: the destination folder is backed up by default.
 - Drag & drop and per-monitor DPI on real hardware.
 - The GUI screenshots still show the 0.1.0-beta layout (they predate the
   "Skipped" section).
